@@ -1,0 +1,450 @@
+---
+title: "VaccineNorway"
+author: "Ruiyun Li"
+date: "27/04/2021"
+output:
+  pdf_document:
+    latex_engine: xelatex
+  html_document: default
+---
+
+This is a R Markdown document attached to **Prioritizing vaccination by age and social activity to advance societal health benefits in Norway**. authors: Ruiyun Li, Ottar N Bjornstad, Ørjan Olsvik, Nils Chr. Stenseth
+
+In this document, we will use a RAS model that integrates realistic age-structure of both demography and social mixing and plausible coverage, timing and efficacy of vaccine. We evaluate the gains achievable by adopting the The Norwegian Institute of Public Health (FHI) vaccination strategies and its relative effectiveness to various strategies.
+
+## Preparation
+
+We will first prepare the datasets, including
+
+* age pyramid
+* age-specific # of contacts
+* mobility variation
+
+We include 17 5-year age groups (i.e. 0-4, 5-9, …, 75-79, >80 years old). To illustrate we use Norway as example. Extention to Norwegian cities: using the cities demography.
+
+```{r message = FALSE, warning = FALSE}
+require("fields")
+wd <- getwd()
+Cont_path <- file.path(wd, "Data", "Contact_matrices")
+Demo_path <- file.path(wd,"Data","Demography")
+Mb_path <- file.path(wd,"Data","Mobility")
+
+# read contact matrix, marginal contacts, demography, mobility
+W_NO <- read.csv(paste0(Cont_path,"/", "Contacts_NORWAY.csv"), header = TRUE)[,2:18]
+Cmarg_NO <- read.csv(paste0(Cont_path,"/", "margContacts_NORWAY.csv"), header = TRUE)[,2]
+Page_NO <- read.csv(paste0(Demo_path, "/", "Pop_NORWAY.csv"), header = TRUE)[,2]
+Mb_NO <- read.csv(paste0(Mb_path, "/", "Mb_NO.csv"))[,2]
+
+```
+
+## Model Framework
+
+The model involves coverage, timing and efficacy of vaccine. We define:
+
+* S - Susceptble
+* E - Exposed
+* Is - Symptomatically infected
+* Ia - Aymptomatically infected
+* R  - Recovered
+* K - Flux into E
+
+- $Q$ - rate of vaccination devided into 5 stages:
+- $Q1$ - FHI strategy for HCWs plus 75+ (stage 1)
+- $Q2$ - FHI strategy for 20-74 with high risk (stage 2)
+- $Q3$ - FHI strategy for 20-74 with other disease (stage 3)
+- $Q4$ - FHI/socibility-descending strategy for group X (stage 4)
+- $Q5$ - Age/Sociability/Switched strategy for annual vaccination campagin (stage 5)
+- $P$ - duration of vaccination
+- $q$ - vaccine efficacy (assmued 0.8)
+- *R0* - Reproduction number
+- 1/$\sigma$ - Average duration of incubation
+- 1/$\gamma$ - Average duration of infection
+- $\omega$ - Rate of loss of infection
+- $\beta0$ - Baseline rate of transmission
+- $\beta1$ - Strength of seasonal forcing (assumed 0.1)
+- $\phi$ - Force of infection (FOI)
+- $\rho1$ - Infectiousness of asymptomatic infections (assumed 0.5)
+- $\rho2$ - Proportion of asymptomatic infections
+- *C* - Normalized contact matrix
+- n   - Number of age groups
+
+```{r}
+seirsvages4vacs = function(t,x,params){
+  n=17
+  S<-x[1:n]
+  E<-x[(n+1):(2*n)]
+  Is<-x[(2*n+1):(3*n)]
+  Ia<-x[(3*n+1):(4*n)]
+  R<-x[(4*n+1):(5*n)]
+  K<-x[(5*n+1):(6*n)]
+  
+  with(as.list(params),{
+    W = as.matrix(Cnorm)
+    # 1 March 2020 - 30 Apr 2021
+    if(t<T_ld+Dt_ld){
+      W = as.matrix(Cnorm)*scaling[t]
+    }
+    # 1 May -30 June 2021
+    if(t>T_ld2 & t<T_ld2+Dt_ld2){ 
+      W = as.matrix(Cnorm)
+      epsilon = epsilon2
+    }
+    WI = W%*%(Is + rho1*Ia)
+    beta0 = R0*((sigma+mu)/sigma)*(gamma+mu)
+    beta = ifelse(t>306, beta0 * (1+beta1 * cos(2 * pi * (t-306)/365)), beta0)
+    phi = k*log(1+beta *WI/(k*N)) # NB() of phi
+     
+    Q1 <- ifelse(t<T1 | t>T1+Dt1,0,(-log(1-P1)/Dt1))
+    Q2 <- ifelse(t<T2 | t>T2+Dt2,0,(-log(1-P2)/Dt2))
+    Q3 <- ifelse(t<T3 | t>T3+Dt3,0,(-log(1-P3)/Dt3))
+    Q4 <- ifelse(t<T4 | t>T4+Dt4,0,(-log(1-P4)/Dt4))
+    Q5 <- if(t>306 & t<Tvacend){
+      ifelse((t-306)%%repeat_Interval<(T5-306) | (t-306)%%repeat_Interval>(T5-306)+Dt5,
+             0,(-log(1-P5)/Dt5))
+    }else{
+      0
+    }
+    
+    dS = c(nu,rep(0,n-1))*N + omega*R -phi*S - q*(Q1+Q2+Q3+Q4+Q5)*S - mu*S
+    dE = phi*S - sigma*E - mu*E
+    dIs = rho2*sigma*E - gamma*Is - mu*Is + epsilon
+    dIa = (1-rho2)*sigma*E - gamma*Ia - mu*Ia + epsilon
+    dR = gamma*(Is+Ia) + q*(Q1+Q2+Q3+Q4+Q5)*S - omega*R - mu*R
+    dK = sigma*E + epsilon
+
+    res<-c(dS,dE,dIs,dIa,dR,dK)
+    list(res)
+  })
+}
+
+```
+
+We define vac2next() which specifcies the prioritized groups. Following FHI vaccination schedule, we firstly prioritize the HWCs, 75+ and people at high risk or have underlying diseases. We then allocate vaccines by two strategies:
+
+* The current FHI age-descending protocol
+* The sociability-descending strategies
+
+Further, we assume an annual vaccination campaign with prioritization to the elderly (75+ yr) and three strategies for the rest of the population:
+
+* The age-focused strategy
+* The sociability-focused strategy
+* The switched strategy: switching from the high-risk older age groups to core-sociable ones
+
+```{r}
+vac2next = function(P_age, tot_cov, cov, next2)
+{
+  # stages 1-3
+  age1 = 4:15; t1 = 8; dur1 = 173; cov1 = cov[1]   # HCWs 15-74
+  age2 = 16:17; t2 = -5; dur2 = 132; cov2 = cov[2] # 75+
+  age3 = 5:15; t3 = 72; dur3 = 109; cov3 = cov[3]  # 20-74 with high risk
+  age4 = 12:13; t4 = 98; dur4 = 46; cov4 = cov[4]  # 55-64 with underlying diseases
+  age5 = 10:11; t5 = 98; dur5 = 53; cov5 = cov[5]  # 45-54 with underlying diseases
+  age6 = 5:9; t6 = 106; dur6 = 52; cov6 = cov[6]   # 20-44 with underlying diseases
+  
+  ## for the ongoing FHI vaccination (stage 4)
+  # The current FHI age-descending protocol
+  age7 = 14:15 # 65-74
+  age8 = 12:13 # 55-64
+  age9 = 10:11 # 45-54
+  age10 = 5:9  # 20-44
+  
+  t7 = t3; dur7 = dur3; cov7 = cov[7]
+  t8 = t4; dur8 = dur4; cov8 = cov[8]
+  t9 = t5; dur9 = dur5; cov9 = cov[9]
+  t10 = t6; dur10 = dur6; cov10 = cov[10]
+  
+  # The sociability-descending strategies
+  soc1 = 3:4    # 10-14, 15-19
+  soc2 = c(2,8) # 5-9,35-39
+  soc3 = c(9,7) # 40-44, 20-25
+  soc4 = c(5,10,6,11,12)
+  
+  cov11 = ifelse(cov[7]*sum(P_age[age7])>sum(P_age[soc1]), 
+                 .99, cov[7]*sum(P_age[age7])/sum(P_age[soc1]))
+  cov12 = ifelse(cov[8]*sum(P_age[age8])>sum(P_age[soc2]), 
+                 .99, cov[8]*sum(P_age[age8])/sum(P_age[soc2]))
+  cov13 = ifelse(cov[9]*sum(P_age[age9])>sum(P_age[soc3]), 
+                 .99, cov[9]*sum(P_age[age9])/sum(P_age[soc3]))
+  cov14 = ifelse(cov[10]*sum(P_age[age10])>sum(P_age[soc4]), 
+                 .99, cov[10]*sum(P_age[age10])/sum(P_age[soc4]))
+  
+  # Across strategies, vaccination for the prioritized groups in stage 1-3
+    P1 = rev(c(rep(cov2,2),rep(cov1,12), rep(0,3)))
+    T1 = rev(c(rep(t2,2),rep(t1,12), rep(366,3)))
+    Dt1 = rev(c(rep(dur2,2),rep(dur1,12), rep(0,3)))
+    
+    P2 = c(rep(0,4),rep(cov3,11), rep(0,2))
+    T2 = c(rep(366,4),rep(t3,11), rep(366,2))
+    Dt2 = c(rep(0,4),rep(dur3,11), rep(0,2))
+    
+    P3 = rev(c(rep(0,4),rep(cov4,2),rep(cov5,2),rep(cov6,5), rep(0,4)))
+    T3 = rev(c(rep(366,4),rep(t4,2),rep(t5,2),rep(t6,5), rep(366,4)))
+    Dt3 = rev(c(rep(0,4),rep(dur4,2),rep(dur5,2),rep(dur6,5), rep(0,4)))
+  
+  # Baseline scenario: no vaccination in stage 4-5
+  if(next2 == "base"){
+    
+    P4 = c(rep(0,17)); T4 = c(rep(366,17)); Dt4 = c(rep(0,17))
+    P5 = c(rep(0,17)); T5 = c(rep(366,17)); Dt5 = c(rep(0,17))
+    
+  }
+  
+  # The current FHI age-descending protocol
+  if(next2 == "next2younger"){
+    
+    P4 = rev(c(rep(0,2),rep(cov7,2),rep(cov8,2),rep(cov9,2),rep(cov10,5),rep(0,4))) 
+    T4 = rev(c(rep(366,2),rep(t7,2),rep(t8,2),rep(t9,2),rep(t10,5),rep(366,4)))
+    Dt4 = rev(c(rep(0,2),rep(dur7,2),rep(dur8,2),rep(dur9,2),rep(dur10,5),rep(0,4)))
+    
+    P5 = c(rep(0,17)); T5 = c(rep(366,17)); Dt5 = c(rep(0,17))
+    
+  }
+  
+  # The sociability-descending strategies
+  if(next2 == "next2social"){
+    
+    P4 = rev(c(rep(0,5),rep(cov14,3),cov13,cov12,cov13,rep(cov14,2),rep(cov11,2),cov12,0)) 
+    T4 = rev(c(rep(366,5),rep(t10,3),t9,t8,t9,rep(t10,2),rep(t7,2),t8,366))
+    Dt4 = rev(c(rep(0,5),rep(dur10,3),dur9,dur8,dur9,rep(dur10,2),rep(dur7,2),dur8,0))
+    
+    P5 = c(rep(0,17)); T5 = c(rep(366,17)); Dt5 = c(rep(0,17))
+    
+  }
+  
+  ## for annual vaccination (stage 5)
+  # The age-focused strategy
+  if(next2 == "ann.age"){
+ 
+    P4 = rev(c(rep(0,2),rep(cov7,2),rep(cov8,2),rep(cov9,2),rep(cov10,5),rep(0,4))) 
+    T4 = rev(c(rep(366,2),rep(t7,2),rep(t8,2),rep(t9,2),rep(t10,5),rep(366,4)))
+    Dt4 = rev(c(rep(0,2),rep(dur7,2),rep(dur8,2),rep(dur9,2),rep(dur10,5),rep(0,4)))
+    
+    P5 = T5 = Dt5 = rep(0, 17)
+    elderly = 16:17; senior = 10:15; others = 1:9
+    P5[elderly] = .99; Dt5[elderly] = 92/3; T5[elderly] = 273
+    P5[senior] = .99; Dt5[senior] = 92/3; T5[senior] = 273+92/3
+    P5[others] = (tot_cov-sum(P_age[c(elderly,senior)]))/sum(P_age[others])
+    Dt5[others] = 92/3; T5[others] = 273+92/3*2
+    
+  }
+  
+  # The sociability-focused strategy
+  if(next2 == "ann.soc"){
+
+    P4 = rev(c(rep(0,2),rep(cov7,2),rep(cov8,2),rep(cov9,2),rep(cov10,5),rep(0,4)))
+    T4 = rev(c(rep(366,2),rep(t7,2),rep(t8,2),rep(t9,2),rep(t10,5),rep(366,4)))
+    Dt4 = rev(c(rep(0,2),rep(dur7,2),rep(dur8,2),rep(dur9,2),rep(dur10,5),rep(0,4)))
+
+    P5 = T5 = Dt5 = rep(0, 17)
+    elderly = 16:17; coresoc = c(3,4,2,8,9,7); others = c(5,10,6,11,12,1,13,14,15)
+    P5[elderly] = .99; Dt5[elderly] = 92/3; T5[elderly] = 273
+    P5[coresoc] = .99; Dt5[coresoc] = 92/3; T5[coresoc] = 273+92/3
+    P5[others] = (tot_cov-sum(P_age[c(elderly, coresoc)]))/sum(P_age[others]) 
+    Dt5[others] = 92/3; T5[others] = 273+92/3
+    
+  }
+
+  # The switched strategy
+  if(next2 == "ann.switch"){
+
+    P4 = rev(c(rep(0,2),rep(cov7,2),rep(cov8,2),rep(cov9,2),rep(cov10,5),rep(0,4))) 
+    T4 = rev(c(rep(366,2),rep(t7,2),rep(t8,2),rep(t9,2),rep(t10,5),rep(366,4)))
+    Dt4 = rev(c(rep(0,2),rep(dur7,2),rep(dur8,2),rep(dur9,2),rep(dur10,5),rep(0,4)))
+    
+    P5 = T5 = Dt5 = rep(0, 17)
+    elderly = 16:17; senior = 10:15; coresoc = c(3,4,2,8,9,7); others = c(6,5,1)
+    rest1 = rest2 = 0
+    P5[elderly] = .99; Dt5[elderly] = 92/3; T5[elderly] = 273
+    if(sum(P_age[senior])<.5*(tot_cov-sum(P_age[elderly]))){
+      P5[senior] = .99; T5[senior] = 273+92/3; Dt5[senior] = 92/3
+      rest1 = .5*(tot_cov-sum(P_age[elderly])) - sum(P_age[senior]*.99)
+    }else{
+      P5[senior] = .5*(tot_cov-sum(P_age[elderly]))/sum(P_age[senior]); 
+      T5[senior] = 273+92/3; Dt5[senior] = 92/3
+    }
+    if(sum(P_age[coresoc])<.5*(tot_cov-sum(P_age[elderly]))){
+      P5[coresoc] = .99; T5[coresoc] = 273+92/3*2; Dt5[coresoc] = 92/3
+      rest2 = .5*(tot_cov-sum(P_age[elderly])) - sum(P_age[coresoc]*.99)
+    }else{
+      P5[coresoc] = .5*(tot_cov-sum(P_age[elderly]))/sum(P_age[coresoc]); 
+      T5[coresoc] = 273+92/3*2; Dt5[coresoc] = 92/3
+    }
+    P5[others] = (rest1+rest2)/sum(P_age[others]); 
+    T5[others] = 273+92/3*2; Dt5[others] = 92/3
+  }
+  
+  return(list(P1=P1, T1=T1, Dt1=Dt1, P2=P2, T2=T2, Dt2=Dt2,
+              P3=P3, T3=T3, Dt3=Dt3, P4=P4, T4=T4, Dt4=Dt4, 
+              P5=P5, T5=T5, Dt5=Dt5))
+}
+
+```
+
+Model is initialized with 0.1% symptomatically and asymptomatically infected individuals. We define function for simulation:
+
+```{r}
+seirsvages4vacssim = function(R0, P_age, W, P1, T1, Dt1, P2, T2, Dt2, P3, T3, Dt3, 
+                              P4, T4, Dt4, P5, T5, Dt5, durIm, scaling, 
+                              Tvacend, repeat_Interval, rho2, k, Cmarg)
+{
+  pars = list(N = 1, sigma=1/3, gamma = 1/5, nu = 0, mu = 0, beta1=.1, 
+              R0 = R0, Cnorm = W, Cmarg = Cmarg, omega=1/durIm, 
+              T_ld = 12, Dt_ld = 306+120-12, scaling = scaling, epsilon = 1e-10,
+              T_ld2 = 306+120, Dt_ld2 = 181-120, epsilon2 = 1e-8, 
+              rho1=.5, rho2=rho2, k=k,
+              q = .8, P1 = P1, Dt1 = Dt1, T1 = 306+T1, # 306: days from 01.03-31.12.20
+              P2 = P2, Dt2 = Dt2, T2 = 306+T2,         # T1-T4: days from 01.01.21
+              P3 = P3, Dt3 = Dt3, T3 = 306+T3,
+              P4 = P4, Dt4 = Dt4, T4 = 306+T4,
+              P5 = P5, Dt5 = Dt5, T5 = 306+T5,         # T5: days from 01 Jan/year
+              Tvacend=Tvacend, repeat_Interval=repeat_Interval)
+  ystart = c(S=.98*P_age,E=0.01*P_age,Is=.01*P_age,Ia=.01*P_age,R=0*P_age,K=0*P_age)
+  out = as.data.frame(ode(ystart, times=times, func = seirsvages4vacs, parms = pars))
+  
+  return(out)
+}
+
+sim_vac2next = function(R0, P_age, tot_cov, scaling, cov, next2, 
+                        Tvacend, repeat_Interval, k)
+{
+  out = seirsvages4vacssim(R0=R0, P_age=P_age, W=W_NO,durIm=365, k = k, 
+                           scaling = scaling, rho2 = rho2, Cmarg = Cmarg_NO,
+                           P1 = vac2next(P_age, tot_cov, cov, next2)$P1,
+                           T1 = vac2next(P_age, tot_cov, cov, next2)$T1, 
+                           Dt1 = vac2next(P_age, tot_cov, cov, next2)$Dt1,
+                           P2 = vac2next(P_age, tot_cov, cov, next2)$P2, 
+                           T2 = vac2next(P_age, tot_cov, cov, next2)$T2,
+                           Dt2 = vac2next(P_age, tot_cov, cov, next2)$Dt2,
+                           P3 = vac2next(P_age, tot_cov, cov, next2)$P3, 
+                           T3 = vac2next(P_age, tot_cov, cov, next2)$T3,
+                           Dt3 = vac2next(P_age, tot_cov, cov, next2)$Dt3,
+                           P4 = vac2next(P_age, tot_cov, cov, next2)$P4, 
+                           T4 = vac2next(P_age, tot_cov, cov, next2)$T4,
+                           Dt4 = vac2next(P_age, tot_cov, cov, next2)$Dt4,
+                           P5 = vac2next(P_age, tot_cov, cov, next2)$P5, 
+                           T5 = vac2next(P_age, tot_cov, cov, next2)$T5,
+                           Dt5 = vac2next(P_age, tot_cov, cov, next2)$Dt5,
+                           Tvacend = Tvacend,repeat_Interval=repeat_Interval)
+  
+  return(out)
+}
+
+```
+
+We now simulate the model:
+
+```{r}
+library(deSolve)
+n = 17                # 17 age groups
+times = 1:(306+365*5) # 01.03.20 - 31.12.25
+R0 = 3.5              # FHI report (R0 around 01.03.20)
+rho1 = .5
+rho2 = c(.29,.29, .21,21, .27,.27, .33,.33, .4,.4, 
+         .49,.49, .63,.63, .69,.69,.69)    # ref. Davies et al. Nature Med
+cov = c(0.093, 0.992, 0.032, 0.170, 0.132, 
+        0.061, 0.818, 0.642, 0.748, 0.861) # FHI coverage for each group
+dose1 = sum(Page_NO[5:17]) # total doses covering all adults
+dose2 = .9                 # total doses covering 90% of the population
+
+NO_base = sim_vac2next(R0, Page_NO, tot_cov=dose1, scaling=Mb_NO, k=.015, 
+                       cov=cov, next2="base",Tvacend=0,repeat_Interval=365*5)
+NO_vacage = sim_vac2next(R0, Page_NO, tot_cov=dose1, scaling=Mb_NO, k=.015, 
+                         cov=cov, next2="next2younger",0,365*5)
+NO_vacsoc = sim_vac2next(R0, Page_NO, tot_cov=dose1, scaling=Mb_NO, k=.015, 
+                         cov=cov, next2="next2social",0,365*5)
+
+NO_ann.age_d1 = sim_vac2next(R0, Page_NO, tot_cov=dose1, scaling=Mb_NO, 
+                             k=.015, cov=cov, next2="ann.age",365*5,365)
+NO_ann.soc_d1 = sim_vac2next(R0, Page_NO, tot_cov=dose1, scaling=Mb_NO, 
+                             k=.015, cov=cov, next2="ann.soc",365*5,365)
+NO_ann.switch_d1 = sim_vac2next(R0, Page_NO, tot_cov=dose1, scaling=Mb_NO, 
+                                k=.015, cov=cov, next2="ann.switch",365*5,365)
+NO_ann.age_d2 = sim_vac2next(R0, Page_NO, tot_cov=dose2, scaling=Mb_NO, k=.015, 
+                             cov=cov, next2="ann.age",365*5,365)
+NO_ann.soc_d2 = sim_vac2next(R0, Page_NO, tot_cov=dose2, scaling=Mb_NO, k=.015, 
+                             cov=cov, next2="ann.soc",365*5,365)
+NO_ann.switch_d2 = sim_vac2next(R0, Page_NO, tot_cov=dose2, scaling=Mb_NO, k=.015, 
+                                cov=cov, next2="ann.switch",365*5,365)
+
+```
+
+To evaluate the effectiveness of vaccination strategies, we estimate the reduction of infections as compared with baseline scenario without vaccination. We define Inf_avert() to evaluate the effectiveness of the FHI age-descending strategy *versus* the sociability-descending strategy. Additionally, we define Inf_avert2() to evaluate the effectiveness of the age-focused and sociability-focused strategies *versus* the switched strategy. 
+
+```{r}
+Inf_avert = function(Infs, t1, t2)  # t1: start_vac_next, t2: est_time
+{
+  Infs0 = apply(Infs[,1:17],1,sum)  # baseline
+  Infs1 = apply(Infs[,18:34],1,sum) # vaccinating by age 
+  Infs2 = apply(Infs[,35:51],1,sum) # vaccinating by sociability
+  
+  t1 = 306+t1
+  t2 = 306+t2
+  Infs_avert1 = (sum(Infs0[t1:t2]) - sum(Infs1[t1:t2])) /sum(Infs0[t1:t2])
+  Infs_avert2 = (sum(Infs0[t1:t2]) - sum(Infs2[t1:t2])) /sum(Infs0[t1:t2])
+  avert = c(Infs_avert1, Infs_avert2)
+  
+  return(c(avert))
+}
+
+Inf_avert2 = function(Infs, t1, t2) # t1: start_vac_next, t2: est_time
+{
+  Infs0 = apply(Infs[,1:17],1,sum)  # baseline
+  Infs1 = apply(Infs[,18:34],1,sum) # vaccinating by age 
+  Infs2 = apply(Infs[,35:51],1,sum) # vaccinating by sociability
+  Infs3 = apply(Infs[,52:68],1,sum) # switched vaccination
+  
+  t1 = 306+t1
+  t2 = 306+t2
+  Infs_avert1 = (sum(Infs0[t1:t2]) - sum(Infs1[t1:t2])) /sum(Infs0[t1:t2])
+  Infs_avert2 = (sum(Infs0[t1:t2]) - sum(Infs2[t1:t2])) /sum(Infs0[t1:t2])
+  Infs_avert3 = (sum(Infs0[t1:t2]) - sum(Infs3[t1:t2])) /sum(Infs0[t1:t2])
+  avert = c(Infs_avert1, Infs_avert2, Infs_avert3)
+  
+  return(c(avert))
+}
+
+```
+
+The effectiveness of the FHI and scociability strategies are estimated by the reduction of infections by the end of the vaccination and after two months of the end of the vaccination. The effectiveness of the age-focused/sociability-focused/switched strategies are estimated by the reduction of infections over a year.
+
+```{r}
+# FHI age-descending strategy vs. the sociability-descending strategy
+Inf_NO = cbind(NO_base[,(2*n+2):(3*n+1)]+NO_base[,(3*n+2):(4*n+1)],
+               NO_vacage[,(2*n+2):(3*n+1)]+NO_vacage[,(3*n+2):(4*n+1)],
+               NO_vacsoc[,(2*n+2):(3*n+1)]+NO_vacsoc[,(3*n+2):(4*n+1)])
+
+start_vac_next = 72 # initial vaccination by age/sociability
+end_vac_next = 181  # ending vaccinating all adults
+
+Inf_avert(Inf_NO, start_vac_next, end_vac_next)
+Inf_avert(Inf_NO, start_vac_next, end_vac_next+60)
+
+barplot(c(Inf_avert(Inf_NO, start_vac_next, end_vac_next),NA,
+          Inf_avert(Inf_NO, start_vac_next, end_vac_next+60),NA),
+        ylim=c(0,.4), beside = FALSE, border="white",space=0,
+        col=rep(c("#f1b14d","darkcyan",NA),2),tck=-.01,
+        ylab="Reduction of infections",
+        font=2,font.axis=2,font.lab=2,cex.lab=1.3)
+
+# age-focused and sociability-focused strategies vs. the switched strategy
+Inf_NO_ann.d1 = cbind(NO_base[,(2*n+2):(3*n+1)]+NO_base[,(3*n+2):(4*n+1)],
+                      NO_ann.age_d1[,(2*n+2):(3*n+1)]+NO_ann.age_d1[,(3*n+2):(4*n+1)],
+                      NO_ann.soc_d1[,(2*n+2):(3*n+1)]+NO_ann.soc_d1[,(3*n+2):(4*n+1)],
+                      NO_ann.switch_d1[,(2*n+2):(3*n+1)]+NO_ann.switch_d1[,(3*n+2):(4*n+1)])
+
+Inf_NO_ann.d2 = cbind(NO_base[,(2*n+2):(3*n+1)]+NO_base[,(3*n+2):(4*n+1)],
+                      NO_ann.age_d2[,(2*n+2):(3*n+1)]+NO_ann.age_d2[,(3*n+2):(4*n+1)],
+                      NO_ann.soc_d2[,(2*n+2):(3*n+1)]+NO_ann.soc_d2[,(3*n+2):(4*n+1)],
+                      NO_ann.switch_d2[,(2*n+2):(3*n+1)]+NO_ann.switch_d2[,(3*n+2):(4*n+1)])
+
+Inf_avert2(Inf_NO_ann.d1, 273, 273+365)
+Inf_avert2(Inf_NO_ann.d2, 273, 273+365)
+
+barplot(c(Inf_avert2(Inf_NO_ann.d1, 273, 273+365),NA,
+          Inf_avert2(Inf_NO_ann.d2, 273, 273+365),NA),
+        ylim=c(0,.4), beside = FALSE, border="white",space=0,
+        col=rep(c("#f1b14d","darkcyan","black",NA),2),tck=-.01,
+        ylab="Reduction of infections",
+        font=2,font.axis=2,font.lab=2,cex.lab=1.3)
+
+```
